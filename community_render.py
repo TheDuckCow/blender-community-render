@@ -18,6 +18,9 @@
 
 """Community Render Add-on for taking user inputs and standardizing outputs.
 
+Used to quickly and dynamically load multiple blend files, transform into a
+standardized state, and help render them out to files.
+
 Tool for preparing multiple blend files for rendering out in standard way. The
 idea is the users (or 'authors') have submitted blend files through e.g. a
 Google Form. Each blend file is loaded into a separately prepared template file
@@ -49,7 +52,7 @@ import bpy
 bl_info = {
     "name": "Community Render",
     "author": "Patrick W. Crawford",
-    "version": (2, 0),
+    "version": (2, 1),
     "blender": (2, 90, 0),
     "location": "Properties > Scene > Community Render",
     "description": "Help load, transform, and render many blend files",
@@ -541,7 +544,8 @@ def process_open_file(context) -> None:
     The processing needed will vary for a given community project. Some sample
     utilities are included by default.
     """
-    process_generic_scene(context)
+    # process_generic_scene(context)
+    process_as_donut(context)
 
 
 def process_generic_scene(context) -> None:
@@ -636,6 +640,211 @@ def process_generic_scene(context) -> None:
     _CENTRAL_OBJ = target_obj
 
 
+def process_as_donut(context):
+    """Process the open file assuming it should be a donut.
+
+    This function is very bespoke to the specific project at hand. In this
+    case, about transforming donuts to be centered in the frame and removing
+    everything else. This functions by editing the library linked in scene,
+    which means that the changes performed by this function are reverted if the
+    library (or open blend file) are ever reloaded. It is not formally using
+    library overrides as part of the blender UI, as those have their own
+    limitations. Plus, we don't want to save override data as we want to fully
+    refresh data between loading one file and the next.
+    """
+    global _CENTRAL_OBJ
+    _CENTRAL_OBJ = None
+
+    props = context.scene.crp_props
+    this_row = props.file_list[props.file_list_index]
+
+    if props.load_original is True:
+        print("Skip process step, not modifying loaded scene")
+        return
+
+    # delete all but allowed mesh types
+    view_layer = get_or_create_layercoll(context, LOCAL_COLLECTION_NAME)
+    coll = view_layer.collection
+    if len(coll.all_objects) != 1:
+        print("Expected only a single object in collection, found:")
+        print(f"{len(coll.all_objects)} in {coll.name}")
+        raise Exception("Issue - more than one object in collection!")
+
+    scn = get_loaded_scene(context)
+    clear_all_animation(scn)
+    hide_ineligible_for_donut(context, scn)
+    unlink_excluded_objects(scn)
+
+    if not scn.collection.all_objects[:]:
+        extend_qc_error(this_row, "No objects (post QC)")
+        print("No objects remain")
+        return
+
+    # Find best candidate for base donut and icing
+    base_donut, from_icing, icing_candidates = get_interest_objects(
+        context, scn, this_row)
+
+    # Move out the remaining candidates.
+    # Note: This still causes some issues where objects were badly moved.
+    # if from_icing is True:
+    #     for remaining in base_with_icing:
+    #         if remaining == donut:
+    #             continue
+    #         remaining.location[0] += 10
+    # elif from_icing is False:
+    #     for remaining in base_candidates:
+    #         if remaining == donut:
+    #             continue
+    #         remaining.location[0] += 10
+
+    if base_donut is None:
+        print("base_donut is None; Self-script error, this shouldn't happen")
+        extend_qc_error(this_row, "Bad script state where base_donut none")
+        return
+
+    print(f"Final choice for base donut: {base_donut.name}")
+
+    # Force ensure the z-rotation is cleared, which would rotate bounding box,
+    # which inflates the size of the donut (thus making it show up smaller)
+    rot = base_donut.rotation_euler[2]
+    base_donut.rotation_euler[2] = 0
+    context.view_layer.update()
+
+    if base_donut.hide_get() or base_donut.hide_viewport or base_donut.hide_render:
+        base_donut.hide_render = False
+        err = "Donut hidden in source scene"
+        print(err)
+        extend_qc_error(this_row, err)
+
+    avg_pos, xy_scale = get_avg_pos_and_scale(context, base_donut)
+    orig_loc = base_donut.location.copy()
+    base_donut.location -= avg_pos  # Center, even with bad origin
+
+    # Reverse rotate.
+    base_donut.rotation_euler[2] = rot
+    context.view_layer.update()
+
+    target_width = 0.1  # In cm
+    if xy_scale > 0.000001:
+        transform_scale = target_width / xy_scale
+    else:
+        transform_scale = 1
+    print(f"XY scale is: {xy_scale} and pos avg {avg_pos}")
+    empty_inst = context.view_layer.objects.active
+    empty_inst.scale = [transform_scale] * 3
+
+    update_non_donuts(context, scn, base_donut, orig_loc, avg_pos,
+                      transform_scale, icing_candidates)
+    update_materials(context, scn)
+
+    # Finally, cache the selected object
+    _CENTRAL_OBJ = base_donut
+
+
+def get_interest_objects(context, scn, this_row):
+    """Return the selected base donut and candidate icing objects."""
+    base_candidates = []
+    for ob in scn.collection.all_objects:
+        if ob.type != 'MESH':
+            print("Cont' due to not mesh", ob.name)
+            continue
+        if ob.parent:
+            # Normally, we would just exclude this object as a donut candidate
+            # if there is a parent object. But let some of the below situations
+            # allow us to ignore there's a parent and consider using the donut
+            # anyways. For instance if the parent is just a plate, or table,
+            # or an empty mesh, or if the parent is excluded/hidden anyways.
+            # Otherwise, we normally assume having a parent means this is icing
+            phide = ob.parent.hide_get() or ob.parent.hide_viewport
+            phide = phide or ob.parent.hide_render
+            phide = phide or ineligible_donut_name(ob.parent.name)
+            # Weird case where an empty object was used as the parent,
+            # treat as if it's an empty
+            mesh = ob.parent.type == 'MESH' and len(
+                ob.parent.data.polygons) < 2
+            phide = phide or mesh
+            if ob.parent.type == 'EMPTY':
+                phide = True  # Don't exclude if only parented to an empty.
+            if not phide:
+                continue
+            else:
+                # Clear the parent so that relocation works
+                ob.parent = None
+        using_geo_nodes = len(
+            [mod for mod in ob.modifiers if mod.type == "NODES"]) > 0
+        if using_geo_nodes:
+            print("Using geometry nodes, not skipping based on polycount")
+        if using_geo_nodes and not using_geo_nodes:
+            print("not skipping geo nodes")
+        if len(ob.data.polygons) < 150 and not using_geo_nodes:
+            print("Contd due to poly count", ob.name)
+            continue
+        base_candidates.append(ob)
+
+    if not base_candidates:
+        extend_qc_error(this_row, "No base mesh found")
+        print("No valid meshes for base")
+        return
+
+    icing_candidates = []
+    print("Detecting icing objects")
+    sm1 = time.time()
+    for ob in scn.collection.all_objects:
+        if ob.type != 'MESH':
+            continue
+        if not ob.particle_systems:
+            continue
+        if len(ob.data.polygons) < 150:
+            continue
+        icing_candidates.append(ob)
+
+        # # Making icing objects smooth shaded.
+        # Disabled, as it was going slow.
+        # print("\t\tSmoothing object")
+        # for f in ob.data.polygons:
+        #     f.use_smooth = True
+
+    sm2 = time.time()
+    icing_time = sm2 - sm1
+    print(f"\tSmoothing took {icing_time:.02f}s")
+
+    # Find candidates which have icing attached
+    base_with_icing = []
+    for ob in base_candidates:
+        any_icing = False
+        for child in ob.children:
+            if child in icing_candidates:
+                any_icing = True
+                break
+        # TODO: Consider doing check also for any non-parented objects, that
+        # are in icing_candidates and have similar bounding box.
+
+        if any_icing:
+            base_with_icing.append(ob)
+
+    from_icing = None
+    if base_with_icing:
+        print("Identified possible base meshes, which have icing on top:")
+        print(base_with_icing)
+        print("Moving all but one of then to the middle")
+        iterate_options = base_with_icing
+        from_icing = True
+    elif base_candidates:
+        iterate_options = base_candidates
+        from_icing = False
+    else:
+        iterate_options = []
+
+    size = 0
+    base_donut = None
+    for donut in iterate_options:
+        _, xy_scale = get_avg_pos_and_scale(context, donut)
+        if xy_scale > size:
+            size = xy_scale
+            base_donut = donut
+    return base_donut, from_icing, icing_candidates
+
+
 def clear_all_animation(scene: bpy.types.Scene) -> None:
     """Remove all animation from the open scene."""
     for ob in scene.collection.all_objects:
@@ -667,6 +876,41 @@ def unlink_excluded_objects(scene: bpy.types.Scene) -> None:
         # that the sprinkles would get deleted too.
         print(f"\tUnlinked excluded layer: {child.collection.name}")
         parent.collection.children.unlink(child.collection)
+
+
+def ineligible_donut_name(compare_name):
+    """Return true if the name contains a word known to not be a donut."""
+    rm_name_prefix = [
+        'cup', 'plate', 'plato', 'taza', 'cup', 'mug', 'table', 'floor',
+        'ground']
+    for rm_name in rm_name_prefix:
+        if rm_name in compare_name.lower():
+            return True
+    return False
+
+
+def hide_ineligible_for_donut(context, scn: bpy.types.Scene) -> None:
+    """Hide (or delete) ineligible objects for render."""
+    print(f"Collection scene is {scn.name}")
+    allow_types = ['EMPTY', 'MESH']
+
+    # Remove items that are clearly meant to not be donuts
+    del_objects = []
+    for ob in scn.collection.all_objects:
+        if ob.type not in allow_types:
+            del_objects.append(ob)
+        elif ineligible_donut_name(ob.name):
+            del_objects.append(ob)
+
+    for obj in del_objects:
+        # Could hide instead of delete for stability, encountered crashes here.
+        # obj.hide_render = True
+        # obj.hide_viewport = True
+        remove_object(context, obj)
+
+    # Cannot use operator override, since in a collection in another scene.
+    # override = generate_context_override(del_objects)
+    # bpy.ops.object.delete(override, use_global=True)
 
 
 def get_avg_pos_and_scale(
@@ -718,6 +962,70 @@ def get_avg_pos_and_scale(
     xy_scale = (current_size[0] + current_size[1]) / 2.0
 
     return avg_pos, xy_scale
+
+
+def update_non_donuts(context,
+                      scn: bpy.types.Scene,
+                      base_donut: bpy.types.Object,
+                      orig_loc: mathutils.Vector,
+                      avg_pos: mathutils.Vector,
+                      scale: float,
+                      icing: Sequence[bpy.types.Object]) -> None:
+    """Update other objects in the scene based on selections so far."""
+
+    # For low poly objects like sprinkles, for simplicity, just move it away
+    for ob in scn.collection.all_objects:
+        if ob.type != 'MESH':
+            ob.location[0] += 100
+            continue
+        using_geo_nodes = len(
+            [mod for mod in ob.modifiers if mod.type == "NODES"]) > 0
+        if len(ob.data.polygons) >= 150 or using_geo_nodes:
+            continue
+        if ob == base_donut:
+            continue  # Should already meet with above conditions, safeguard.
+        ob.location[0] += 100
+
+        # Optional: remove modifiers.
+        # for mod in ob.modifiers:
+        #    ob.modifiers.remove(mod)
+
+    # For any object near the selected target object and was not parented,
+    # move it by the same amount too. Base on geometry bounds (vs origin).
+    print("\tMove other objects in parallel, if close")
+    for ob in scn.collection.all_objects:
+        if ob == base_donut:
+            continue
+        ob_bounds = [ob.matrix_world @ mathutils.Vector(corner)
+                     for corner in ob.bound_box]
+        pt = mathutils.Vector([0, 0, 0])
+        for point in ob_bounds:
+            pt += point
+        ob_avg = pt / 8
+
+        no_parent = not ob.parent
+        dist_check = 0.1 / scale
+        if (orig_loc - ob_avg).length < dist_check and no_parent:
+            print(f"\t> Moved {ob.name}")
+            ob.location -= avg_pos
+
+    # Anything that has no materials AND no particles, just hide.
+    print("\tHide objs without materials")
+    for ob in scn.collection.all_objects:
+        if ob.type != 'MESH':
+            continue
+        if ob.material_slots:
+            continue
+        if ob == base_donut:
+            print("Base donut has not materials!")
+            continue
+        if ob in icing:
+            continue
+
+        # Somehow, assigning visibility can crash blender. Instead, move aside.
+        # ob.hide_render = True
+        # ob.hide_viewport = True
+        ob.location[0] += 100
 
 
 def update_materials(context, scn: bpy.types.Scene) -> None:
@@ -1181,6 +1489,36 @@ def setup_small_render(context):
         obj.hide_render = True
         obj.hide_viewport = True
 
+
+def setup_sprinkle_render(context):
+    """Assign settings for the sprinkle render pass."""
+    props = context.scene.crp_props
+    row = props.file_list[props.file_list_index]
+    use_form = props.output_by_id and row.src_file_id
+    outname = row.src_file_id if use_form else row.src_blend
+    outfile = get_sprinkle_render_path(context, outname)[:-4]
+    context.scene.render.filepath = outfile
+
+    global PRIOR_RENDER
+    if not PRIOR_RENDER:
+        PRIOR_RENDER = (
+            context.scene.render.resolution_x,
+            context.scene.render.resolution_y)
+
+    # Sprinkle render pass has hard coded size of 50, since we are just using
+    # to pick up most frequent pixel size.
+    context.scene.render.resolution_x = 50
+    context.scene.render.resolution_y = 50
+    context.scene.render.resolution_percentage = 100
+
+    obj = bpy.data.objects.get(AUTHOR_TEXT_OBJ)
+    if obj:
+        obj.hide_render = True
+        obj.hide_viewport = True
+    obj = bpy.data.objects.get(COUNTRY_TEXT_OBJ)
+    if obj:
+        obj.hide_render = True
+        obj.hide_viewport = True
 
 # -----------------------------------------------------------------------------
 # Blender Handler events
@@ -1784,10 +2122,6 @@ class CRP_UL_source_files(bpy.types.UIList):
         row.label(text=item.label)
         if item.qc_error:
             row.label(text="", icon="ERROR")
-        # elif item.queue_status == READY:
-        #     row.label(text="", icon="CHECKBOX_DEHLT")
-        # elif item.queue_status == DONE:
-        #     row.label(text="", icon="CHECKBOX_HLT")
         icon = "RESTRICT_RENDER_OFF" if item.render_exists else "RESTRICT_RENDER_ON"
         row.label(text="", icon=icon)
 
