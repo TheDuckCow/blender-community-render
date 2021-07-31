@@ -18,10 +18,8 @@
 
 """Community Render Add-on for taking user inputs and standardizing outputs.
 
-Used to quickly and dynamically load multiple blend files, transform into a
-standardized state, and help render them out to files.
-
-The idea is the users (or 'authors') have submitted blend files through e.g. a
+Tool for preparing multiple blend files for rendering out in standard way. The
+idea is the users (or 'authors') have submitted blend files through e.g. a
 Google Form. Each blend file is loaded into a separately prepared template file
 (template assigns render settings and lighting), some prep work done to
 standardize the pulled in file, and then render it out to disk.
@@ -31,8 +29,10 @@ Some key factors for how this addon works:
 - This single scene is loaded in and instanced as an empty.
 - The addon then "processes" the scene based on whatever is fit for the project
   (such as centering and selecting the intended object, clearing animations,
-  and resizing to fit the render).
-- Addon keeps tracks the overall render status of all entries.
+  fixing broken material links with default materials, and resizing to fit the
+  render).
+- Addon keeps tracks and can output the overall metadata status of the renders
+  created (e.g. to keep track of what ended up being included).
 """
 
 import csv
@@ -49,7 +49,7 @@ import bpy
 bl_info = {
     "name": "Community Render",
     "author": "Patrick W. Crawford",
-    "version": (1, 5),
+    "version": (2, 0),
     "blender": (2, 90, 0),
     "location": "Properties > Scene > Community Render",
     "description": "Help load, transform, and render many blend files",
@@ -62,7 +62,7 @@ bl_info = {
 CSV_META_PATH = "//csv_metadata.csv"
 CSV_OUTPUT = "//csv_output.csv"
 
-# Label of the the project, used in some places such as the panel
+# Label of the the project, used in some places such as the panel.
 PROJECT_NAME = "Community Render"
 
 # This is name of the collection in the master template to clear and load in
@@ -80,16 +80,16 @@ COUNTRY_TEXT_OBJ = "country_text"
 # Image (next to render template) to use for any material has missing images.
 REPLACEMENT_IMAGE = "default_texture.png"
 
-# Enum value names for reuse
+# Enum value names for reuse.
 READY = "ready"
 DONE = "done"
 SKIP = "skip"
 NOT_QUEUED = "not_queued"
 
-# Used to temporarily save render samples before thumbnail render
+# Used to temporarily save render samples before thumbnail render.
 PRIOR_RENDER = ()
 
-# Stats used in UI, cached to avoid slow draws + enums
+# Stats used in UI, cached to avoid slow draws + enums.
 scene_stats = {}
 NON_BLEND = "non_blend"
 BLEND_COUNT = "blends"
@@ -99,11 +99,30 @@ NO_FORM_MATCH = "no_form_match"
 
 # Flag to skip the finish render handler, after doing the thumbnail render.
 _MID_RENDER = False
-# Time in s that the current render started
+# Time in s that the current render started.
 _RENDER_START = 0
 # Number of renders completed this session.
 _RENDER_COUNT = 0
 
+# Used to avoid repeat calls to OS filesystem, which can be quite slow if
+# using a fuse system. Assumed to use and clear immediately around loop, not
+# for keeping long term cache of file precense.
+_EXISTING_FILE_CACHE = []
+
+# Listing of qc errors that exist across all files, pre-split.
+_QC_ERROR_LIST_CACHE = []
+
+# Selected object to center on, cached from load for specific uses on render.
+_CENTRAL_OBJ = None
+
+# Cache for the form data itself, since used multiple times.
+_FORM_DATA = {}
+
+# Reusable error names, if used more than once
+ERR_NOT_LATEST_ENTRY = "Not the latest entry for this email"
+ERR_CRASHED = "crashed"
+ERR_SKIP = "skip"
+ERR_NO_FORM_ID = "No form id match"
 
 # -----------------------------------------------------------------------------
 # General utilities
@@ -130,21 +149,6 @@ def generate_context_override(obj_list: Sequence[bpy.types.Object] = None
     return override
 
 
-def make_annotations(cls) -> object:
-    """Converts class fields to annotations if running with Blender 2.8"""
-    if bpy.app.version < (2, 80):
-        return cls
-    bl_props = {k: v for k, v in cls.__dict__.items() if isinstance(v, tuple)}
-    if bl_props:
-        if '__annotations__' not in cls.__dict__:
-            setattr(cls, '__annotations__', {})
-        annotations = cls.__dict__['__annotations__']
-        for k, v in bl_props.items():
-            annotations[k] = v
-            delattr(cls, k)
-    return cls
-
-
 def disable_auto_py(context) -> None:
     """Security measure to ensure auto-run python scripts is turned off."""
     prefs = context.preferences
@@ -161,6 +165,28 @@ def format_seconds(seconds: float) -> str:
     sec = int(remain % 60)
     minutes = int(remain // 60)
     return f"{hours:02d}:{minutes:02d}:{sec:02d}"
+
+
+def cache_os_paths(context) -> Sequence[str]:
+    """Returns a list of absolute paths for all files in particular folders.
+
+    This is memory intensive (especially being absolute paths), but faster.
+    """
+    global _EXISTING_FILE_CACHE
+    cache_paths = ["qc_errors", "render_full", "render_small"]
+    ext = ['.txt', '.png', '.jpg', '.jpeg']
+
+    props = context.scene.crp_props
+
+    for path in cache_paths:
+        sub = os.path.join(bpy.path.abspath(props.config_folder), path)
+        if not os.path.isdir(sub):
+            continue
+        print("\tCaching folder", sub)
+        files = [os.path.join(sub, this) for this in os.listdir(sub)
+                 if os.path.isfile(os.path.join(sub, this))
+                 and os.path.splitext(this.lower())[-1] in ext]
+        _EXISTING_FILE_CACHE.extend(files)
 
 
 # -----------------------------------------------------------------------------
@@ -196,8 +222,124 @@ def get_blend_file_list(context) -> Sequence[str]:
     return sorted(files)
 
 
+def qc_error_path(context, src_blend: str) -> str:
+    """Return a the path for a given blend file's qc_error file."""
+    props = context.scene.crp_props
+    subpath = os.path.join(bpy.path.abspath(props.config_folder), "qc_errors")
+    if not os.path.isdir(subpath):
+        os.mkdir(subpath)
+    path = os.path.join(subpath, f"{src_blend}.txt")
+    return path
+
+
+def read_qc_error(src_blend, context) -> Optional[str]:
+    """Read the QC error text if any has been saved to disk."""
+    path = qc_error_path(context, src_blend)
+    lines = ""
+
+    # Exit early if cache is set and not populated.
+    if _EXISTING_FILE_CACHE and path not in _EXISTING_FILE_CACHE:
+        return lines
+
+    # Otherwise, load the file.
+    if os.path.isfile(path):
+        with open(path, 'r') as fd:
+            lines = fd.read()
+    return lines
+
+
+def save_qc_error(self, context) -> None:
+    """Save out error as txt, not overwriting if one exists already."""
+    path = qc_error_path(context, self.src_blend)
+    if self.qc_error and not os.path.isfile(path):
+        print(f"To save QC error: {path}")
+        with open(path, 'w') as fd:
+            fd.write(self.qc_error)
+
+
+def get_all_qc_errors(context) -> Sequence[str]:
+    """Pull any and all QC errors, for use in dropdown filters."""
+    global _QC_ERROR_LIST_CACHE
+    if _QC_ERROR_LIST_CACHE:
+        return _QC_ERROR_LIST_CACHE
+
+    props = context.scene.crp_props
+    qc_dir = os.path.join(bpy.path.abspath(props.config_folder), "qc_errors")
+    results = []
+    for subpath in os.listdir(qc_dir):
+        if not subpath.lower().endswith(".txt"):
+            continue
+        with open(os.path.join(qc_dir, subpath), 'r') as fd:
+            lines = fd.read()
+        qc_errors = lines.split(";")
+        for err in qc_errors:
+            base_name = err.split(":")[0]  # Chop off e.g. :2 for counts.
+            if base_name not in results:
+                results.append(base_name)
+    _QC_ERROR_LIST_CACHE = results
+    return results
+
+
+def get_crash_cache_path(context) -> str:
+    """Return the path used for saving cache output."""
+    cache_name = "crash_cache_blend.txt"
+    props = context.scene.crp_props
+    return bpy.path.abspath(os.path.join(props.config_folder, cache_name))
+
+
+def load_crash_cache(context) -> None:
+    """Check if a blend file's crash cache file is still present.
+
+    We assume that if this blend file exists at the time this function runs,
+    it means that it had crashed the prior time.
+    """
+    print("Checking for crash cache")
+    path = get_crash_cache_path(context)
+    if not os.path.isfile(path):
+        return
+    with open(path, 'r') as fd:
+        crashed_blend = fd.read()
+    clear_blend_crash_cach(context)
+
+    props = context.scene.crp_props
+    applied = False
+    for row in props.file_list:
+        if row.src_blend != crashed_blend:
+            continue
+        extend_qc_error(row, ERR_CRASHED, increment=True)
+        print("Detected a crash! Applied QC error to " + row.src_blend)
+        applied = True
+        break
+    if not applied:
+        print("Detected crash! **But QC lookup failed** " + crashed_blend)
+
+
+def save_blend_to_crash_cache(context) -> None:
+    """Save a target blend file to a cache file to detect crashing."""
+
+    # Idnetify and process any cache before applying the new cache.
+    load_crash_cache(context)
+
+    props = context.scene.crp_props
+    this_row = props.file_list[props.file_list_index]
+    with open(get_crash_cache_path(context), 'w') as fd:
+        fd.write(this_row.src_blend)
+    print("\tSaved crash cache")
+
+
+def clear_blend_crash_cach(context) -> None:
+    """Remove the blend cache file, either on success or next run."""
+    try:
+        os.remove(get_crash_cache_path(context))
+        # pass
+    except OSError:
+        pass
+
+
 def load_active_row(context) -> None:
     """Load the active row's input."""
+    print("")
+    print("Processing row to load:")
     load_active_selection(context)  # First, replace the loaded collection.
     process_open_file(context)  # Now run the process function
     update_scene_stats(context)  # QC may have updated
@@ -339,12 +481,13 @@ def replace_view_layer(context, scene: bpy.types.Scene) -> bpy.types.Object:
         obj.empty_display_type = 'CUBE'
         obj.empty_display_size = 0.1
 
-    # instance.location = (0,0,0) # already the default
+    obj.location = (0, 0, 0)
     return obj
 
 
 def load_csv_metadata(context) -> Dict:
     """Load in the local C(T)SV metadata download of user form responses."""
+    global _FORM_DATA
     path = get_responses_path(context)
     if not os.path.isfile(path):
         print("TSV file not found!")
@@ -352,24 +495,38 @@ def load_csv_metadata(context) -> Dict:
 
     data = {}
     header = None
+    email_cache = set()
     with open(path, 'r', encoding='utf-8') as fd:
         rd = csv.reader(fd, delimiter="\t", quotechar='"')
-        for row in rd:
-            if not header:
-                header = row
-                if "blend_filename" not in header:
-                    raise Exception("blend_filename not in CSV header")
-                if "full_name" not in header or "country" not in header:
-                    raise Exception("full_name/country not in CSV header")
-                continue
+
+        # Using iterator directly would be better performance, but we need to
+        # look at entries in reverse, and so we list-ify.
+        all_rows = list(rd)
+        header = all_rows[0]
+        if "blend_filename" not in header:
+            raise Exception("blend_filename not in CSV header")
+        if "full_name" not in header or "country" not in header:
+            raise Exception("full_name/country not in CSV header")
+        for row in reversed(all_rows[:-1]):
 
             key = row[header.index("blend_filename")]
             user_name = row[header.index("full_name")]
             country = row[header.index("country")]
+            url = row[header.index("blend_url")]
 
-            # TODO: Check for profanity / other user-entered text issues.
-            data[key] = {0: user_name, 1: country}
-    return data
+            # Instead of using timestamp, assume earlier rows = earlier entries,
+            # and so we only included latest entry per email because we are
+            # going in reverse order.
+            email = row[header.index("email")]
+            if email in email_cache:
+                latest = False
+            else:
+                latest = True
+                email_cache.add(email)
+
+            data[key] = {0: user_name, 1: country, 2: url, 3: latest}
+    # Save to global var for reuse.
+    _FORM_DATA = data
 
 
 def process_open_file(context) -> None:
@@ -399,6 +556,9 @@ def process_generic_scene(context) -> None:
       scene is loaded as in instance into another scene (as this add-on does).
     - Scales and re-centers the scene around the visible meshes.
     """
+    global _CENTRAL_OBJ
+    _CENTRAL_OBJ = None
+
     props = context.scene.crp_props
     this_row = props.file_list[props.file_list_index]
 
@@ -426,7 +586,7 @@ def process_generic_scene(context) -> None:
     unlink_excluded_objects(scene)
 
     # Keep materials the same, just replace missing texture with a default.
-    # update_materials(scene)
+    # update_materials(context, scene)
 
     # Completely clear and re-generate any materials missing images.
     # regenerate_missing_materials(scene)
@@ -439,7 +599,12 @@ def process_generic_scene(context) -> None:
     for obj in scene.collection.all_objects:
         if obj.type != 'MESH':
             continue
-        if len(obj.data.polygons) < 100:  # Likely a plane or backdrop.
+        using_geo_nodes = len(
+            [mod for mod in obj.modifiers if mod.type == "NODES"]) > 0
+        if using_geo_nodes:
+            print("not skipping geo nodes")
+        if len(obj.data.polygons) < 100 and not using_geo_nodes:
+            # Likely a plane or backdrop.
             continue
         this_pos, this_scale = get_avg_pos_and_scale(context, obj)
         if target_obj is None or this_scale > xy_scale:
@@ -448,7 +613,7 @@ def process_generic_scene(context) -> None:
             target_obj = obj
 
     if target_obj is None:
-        this_row.qc_error = "Could not select target object"
+        extend_qc_error(this_row, "Could not select target object")
         print("No objects remain")
         return
     else:
@@ -467,6 +632,9 @@ def process_generic_scene(context) -> None:
     empty_inst = context.view_layer.objects.active
     empty_inst.scale = [transform_scale] * 3
 
+    # Finally, cache the base selected object
+    _CENTRAL_OBJ = target_obj
+
 
 def clear_all_animation(scene: bpy.types.Scene) -> None:
     """Remove all animation from the open scene."""
@@ -480,19 +648,25 @@ def unlink_excluded_objects(scene: bpy.types.Scene) -> None:
     Will also attempt to remove archived or default hidden collections
     """
     master = scene.view_layers[0].layer_collection
-    for child in master.children:
+    recursive_children = [[master, child] for child in list(master.children)]
+    for parent, child in recursive_children:
         excluded = child.exclude is True
         # archive = "archive" not in child.name.lower()
         hidden = child.collection.hide_viewport or child.collection.hide_render
         hidden = hidden or child.hide_viewport  # Like hide_get() for objects.
 
         # If collection is archive, always exclude it.
+        # Initially was removing if "archive", but some scenes actually did
+        # have their scenes in the scene "archive", so need to not remove that.
         if not (excluded or hidden):
+            if child.children:
+                recursive_children += [
+                    [child, sub] for sub in list(child.children)]
             continue
         # Just unlink this view layer. Deleting objects would likely mean
         # that the sprinkles would get deleted too.
         print(f"\tUnlinked excluded layer: {child.collection.name}")
-        master.collection.children.unlink(child.collection)
+        parent.collection.children.unlink(child.collection)
 
 
 def get_avg_pos_and_scale(
@@ -503,6 +677,7 @@ def get_avg_pos_and_scale(
         average position: XYZ position based on bounding box, not origin.
         scale: Width of object (average of xy individually).
     """
+    context.view_layer.update()  # Helps for geometry nodes bounds.
     sum_pos = mathutils.Vector([0, 0, 0])
     min_x = None
     max_x = None
@@ -545,12 +720,15 @@ def get_avg_pos_and_scale(
     return avg_pos, xy_scale
 
 
-def update_materials(scn: bpy.types.Scene) -> None:
+def update_materials(context, scn: bpy.types.Scene) -> None:
     """Replace missing image links in scene with the default image."""
     default = None
-    default_path = bpy.path.abspath("//" + REPLACEMENT_IMAGE)
+    crp_props = context.scene.crp_props
+    img_path = os.path.join(crp_props.config_folder, REPLACEMENT_IMAGE)
+    default_path = bpy.path.abspath(img_path)
     if not os.path.isfile(default_path):
-        raise Exception(f"Default texture is missing: {default_path}")
+        print(f"Default texture is missing: {default_path}")
+        return
     for img in bpy.data.images:
         if img.filepath and bpy.path.abspath(img.filepath) == default_path:
             default = img
@@ -698,6 +876,7 @@ def disable_displacement(material: bpy.types.Material) -> None:
     for link in del_links:
         material.node_tree.links.remove(link)
 
+
 # -----------------------------------------------------------------------------
 # Render functions and controllers
 # -----------------------------------------------------------------------------
@@ -773,6 +952,7 @@ def initiate_render_queue(context) -> None:
     if len(remaining_renders) <= 1:
         props.render_running = True
         render_next_in_queue(context, interactive=True)
+        props.render_running = False
     else:
         props.render_running = True  # Don't trigger handler, manage directly.
 
@@ -794,6 +974,17 @@ def render_next_in_queue(context, interactive: bool) -> None:
 
     # get the next not-done id in the queue
     for i, row in enumerate(props.file_list):
+        # Intentionally skip those that crashed multiple times in a row.
+        if qc_error_count(row.qc_error, name=ERR_CRASHED) > 2:
+            print("Skipping crashing blend: " + row.src_blend)
+            continue
+
+        if ERR_NOT_LATEST_ENTRY in row.qc_error:
+            print("Skipping non-latest entry for email: " + row.src_blend)
+            continue
+        if ERR_SKIP in row.qc_error.lower():
+            print("Blend file marked as to skip: " + row.src_blend)
+            continue
         if row.queue_status == READY:
             next_id = i
             break
@@ -813,12 +1004,12 @@ def render_next_in_queue(context, interactive: bool) -> None:
     #     print("Skip render due to QC errors")
     #     return
 
-    # Either way, quickly render the small image
-    print(f"Now render {props.file_list[props.file_list_index]}")
-    setup_small_render(context)
-
-    # skip handler once to avoid recursive render completion handler trigger.
+    # skip handler to avoid recursive render completion handler trigger.
     global _MID_RENDER
+
+    # Either way, quickly render the small image
+    print(f"Rendering small pass for {props.file_list[props.file_list_index]}")
+    setup_small_render(context)
     _MID_RENDER = True
     bpy.ops.render.render('EXEC_DEFAULT',
                           write_still=True,
@@ -827,7 +1018,7 @@ def render_next_in_queue(context, interactive: bool) -> None:
 
     # Then see about potentially making the full res visually pop up.
     if interactive:
-        print("Render interactive; large render only")
+        print("Rendering large pass")
         setup_large_render(context)
         bpy.ops.render.render('INVOKE_DEFAULT',
                               write_still=True,
@@ -843,7 +1034,7 @@ def render_next_in_queue(context, interactive: bool) -> None:
 
 
 def single_render_complete(context) -> None:
-    """On the completion of a single preview type render, called via handler"""
+    """On the completion of a single render, called via handler."""
     props = context.scene.crp_props
     row = props.file_list[props.file_list_index]
     print("Post render processing: id:{} ({})".format(
@@ -852,7 +1043,9 @@ def single_render_complete(context) -> None:
 
     # Update row stats accordingly
     row.queue_status = DONE
-    row.render_exists = renders_exist_for_row(context, row)
+    use_form = props.output_by_id and row.src_file_id
+    checkname = row.src_file_id if use_form else row.src_blend
+    row.render_exists = renders_exist_for_row(context, checkname)
     if not row.render_exists:
         print("Render not found after complete! For: " + row.src_blend)
 
@@ -860,33 +1053,45 @@ def single_render_complete(context) -> None:
     update_scene_stats(context)
 
 
-def get_large_render_path(context, row) -> str:
+def get_large_render_path(context, src_name: str) -> str:
     """Given a class instance of submission, return expected path.
 
     Args:
-        row: Instance of FileListProps.
+        src_name: Either src_blend with extension or src_file_id from form.
     """
-    return _get_generic_render_path(context, row, "render_full")
+    return _get_generic_render_path(context, src_name, "render_full")
 
 
-def get_small_render_path(context, row) -> str:
+def get_small_render_path(context, src_name: str) -> str:
     """Given a class instance of submission, return expected path.
 
     Args:
-        row: Instance of FileListProps.
+        src_name: Either src_blend with extension or src_file_id from form.
     """
-    return _get_generic_render_path(context, row, "render_small")
+    return _get_generic_render_path(context, src_name, "render_small")
 
 
-def _get_generic_render_path(context, row, subpath) -> str:
+def get_sprinkle_render_path(context, src_name: str) -> str:
+    """Given a class instance of submission, return expected path.
+
+    Args:
+        src_name: Either src_blend with extension or src_file_id from form.
+    """
+    return _get_generic_render_path(context, src_name, "render_sprinkle_pass")
+
+
+def _get_generic_render_path(context, src_name: str, subpath: str) -> str:
     """Sub function to ensure fetching a consistent style of path.
 
     Args:
-        row: Instance of FileListProps.
+        src_name: Source blend file name with extension, or drive file id.
         subpath: The sub-folder at the end of the base render output path.
     """
     props = context.scene.crp_props
-    base = row.src_blend[:-6]  # To safely drop off ".blend", even if caps.
+    if src_name.lower().endswith('.blend'):
+        base = src_name[:-6]  # To safely drop off ".blend", even if caps.
+    else:
+        base = src_name  # Assume it was a drive file id, don't truncate.
 
     # Edge case where user had xyz..blend, but even if the last . is kept,
     # blender render treats the dot as part of suffix, which would cause the
@@ -899,10 +1104,22 @@ def _get_generic_render_path(context, row, subpath) -> str:
         props.config_folder, subpath, filename))
 
 
-def renders_exist_for_row(context, row):
-    """Verify if all expected renders exist for a given row."""
-    large_exists = os.path.isfile(get_large_render_path(context, row))
-    small_exists = os.path.isfile(get_small_render_path(context, row))
+def renders_exist_for_row(context, src_name: str):
+    """Verify if all expected renders exist for a given row.
+
+    Args:
+        src_name: Either src_blend or src_file_id.
+    """
+    lg_path = get_large_render_path(context, src_name)
+    sm_path = get_small_render_path(context, src_name)
+    # sp_path = get_sprinkle_render_path(context, src_name)
+
+    if _EXISTING_FILE_CACHE:
+        large_exists = lg_path in _EXISTING_FILE_CACHE
+        small_exists = sm_path in _EXISTING_FILE_CACHE
+    else:
+        large_exists = os.path.isfile(lg_path)
+        small_exists = os.path.isfile(sm_path)
     return large_exists and small_exists
 
 
@@ -910,7 +1127,10 @@ def setup_large_render(context):
     """Assign settings for the larger scale render."""
     props = context.scene.crp_props
     row = props.file_list[props.file_list_index]
-    outfile = get_large_render_path(context, row)[:-4]  # Drop off .png
+
+    use_form = props.output_by_id and row.src_file_id
+    outname = row.src_file_id if use_form else row.src_blend
+    outfile = get_large_render_path(context, outname)[:-4]  # Drop .png
     context.scene.render.filepath = outfile
 
     global PRIOR_RENDER
@@ -923,16 +1143,23 @@ def setup_large_render(context):
         context.scene.render.resolution_y = PRIOR_RENDER[1]
     context.scene.render.resolution_percentage = 100
 
-    obj = bpy.data.objects[AUTHOR_TEXT_OBJ]
-    obj.hide_render = False
-    obj.hide_viewport = False
+    obj = bpy.data.objects.get(AUTHOR_TEXT_OBJ)
+    if obj:
+        obj.hide_render = False
+        obj.hide_viewport = False
+    obj = bpy.data.objects.get(COUNTRY_TEXT_OBJ)
+    if obj:
+        obj.hide_render = False
+        obj.hide_viewport = False
 
 
 def setup_small_render(context):
-    """Assign settings for the larger scale render."""
+    """Assign settings for the smaller scale render."""
     props = context.scene.crp_props
     row = props.file_list[props.file_list_index]
-    outfile = get_small_render_path(context, row)[:-4]  # Drop off .png
+    use_form = props.output_by_id and row.src_file_id
+    outname = row.src_file_id if use_form else row.src_blend
+    outfile = get_small_render_path(context, outname)[:-4]  # Drop .png
     context.scene.render.filepath = outfile
 
     global PRIOR_RENDER
@@ -945,9 +1172,14 @@ def setup_small_render(context):
     context.scene.render.resolution_y = props.thumbnail_pixels
     context.scene.render.resolution_percentage = 100
 
-    obj = bpy.data.objects[AUTHOR_TEXT_OBJ]
-    obj.hide_render = True
-    obj.hide_viewport = True
+    obj = bpy.data.objects.get(AUTHOR_TEXT_OBJ)
+    if obj:
+        obj.hide_render = True
+        obj.hide_viewport = True
+    obj = bpy.data.objects.get(COUNTRY_TEXT_OBJ)
+    if obj:
+        obj.hide_render = True
+        obj.hide_viewport = True
 
 
 # -----------------------------------------------------------------------------
@@ -1095,7 +1327,7 @@ class SCENE_OT_render_all_interactive(bpy.types.Operator):
             context.area.header_text_set(None)
             return {'CANCELLED'}
 
-        return {'RUNNING_MODAL'}
+        return {'PASS_THROUGH'}
 
 
 class SCENE_OT_mark_qc_error(bpy.types.Operator):
@@ -1104,7 +1336,7 @@ class SCENE_OT_mark_qc_error(bpy.types.Operator):
     bl_label = "Assign QC Error"
     bl_options = {'REGISTER', 'UNDO'}
 
-    qc_error = bpy.props.StringProperty(
+    qc_error: bpy.props.StringProperty(
         name="Error",
         description="Error message text to save")
 
@@ -1124,6 +1356,11 @@ class SCENE_OT_mark_qc_error(bpy.types.Operator):
         if os.path.isfile(path):
             os.remove(path)
         row.qc_error = self.qc_error  # Will auto save next text
+
+        # Clear the cache to force a full reload of QC errors on next draw
+        global _QC_ERROR_LIST_CACHE
+        _QC_ERROR_LIST_CACHE = []
+
         return {'FINISHED'}
 
 
@@ -1136,90 +1373,289 @@ class SCENE_OT_delete_render(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.crp_props
         row = props.file_list[props.file_list_index]
-        fullsize_path = get_large_render_path(context, row)
-        thumbsize_path = get_small_render_path(context, row)
-        try:
-            os.remove(fullsize_path)
-        except OSError as err:
-            print(f"Error deleting renders: {err}")
+        use_form = props.output_by_id and row.src_file_id
+        checkname = row.src_file_id if use_form else row.src_blend
 
-        try:
-            os.remove(thumbsize_path)
-        except OSError as err:
-            print(f"Error deleting renders: {err}")
+        passes = [get_large_render_path(context, checkname),
+                  get_small_render_path(context, checkname),
+                  get_sprinkle_render_path(context, checkname)]
+
+        for img_pass in passes:
+            try:
+                os.remove(img_pass)
+            except OSError as err:
+                print(f"Error deleting renders: {err}")
 
         # Don't just assume it worked, use the same logical check as elsewhere.
-        row.render_exists = renders_exist_for_row(context, row)
+        row.render_exists = renders_exist_for_row(context, checkname)
         return {'FINISHED'}
 
 
+class SCENE_OT_load_from_id(bpy.types.Operator):
+    """Load a blend file from an id."""
+    bl_idname = "crp.load_from_id"
+    bl_label = "Delete render"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    src_file_id: bpy.props.StringProperty(default="")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Enter the drive file id (no suffix) to search")
+        layout.prop(self, "src_file_id", text="")
+
+    def execute(self, context):
+        props = context.scene.crp_props
+        for i, row in enumerate(props.file_list):
+            if row.src_file_id != self.src_file_id:
+                continue
+            props.file_list_index = i
+            return {'FINISHED'}
+        self.report({'WARNING'}, "Failed to load row with id.")
+        return {'CANCELLED'}
+
+
 # -----------------------------------------------------------------------------
-# UI definitions
+# UI callback definitions
 # -----------------------------------------------------------------------------
 
 
-def qc_error_path(context, src_blend: str) -> str:
-    """Return a the path for a given blend file's qc_error file."""
-    props = context.scene.crp_props
-    subpath = os.path.join(bpy.path.abspath(props.config_folder), "qc_errors")
-    if not os.path.isdir(subpath):
-        os.mkdir(subpath)
-    path = os.path.join(subpath, f"{src_blend}.txt")
-    return path
+def update_qc_error(self, context) -> None:
+    """Property update callback."""
+    save_qc_error(self, context)
 
 
-def read_qc_error(self, context) -> Optional[str]:
-    """Read the QC error text if any has been saved to disk."""
-    path = qc_error_path(context, self.src_blend)
-    lines = ""
-    if os.path.isfile(path):
-        with open(path, 'r') as fd:
-            lines = fd.read()
-    return lines
+def extend_qc_error(this_row, apply_error: str, increment: bool = False) -> bool:
+    """Update without replacement to the comma separated list of QC flags.
+
+    Should be called instead of directly changing qc_error.
+
+    Returns:
+        True if updated, false if not.
+    """
+    # Go from "err_name;crashes:1" to ['err_name', 'crashes']
+    if this_row.qc_error:
+        current_source = [err for err in this_row.qc_error.split(";") if err]
+        current_prefix = [err.split(":")[0]
+                          for err in this_row.qc_error.split(";") if err]
+    else:
+        current_source = []
+        current_prefix = []
+    apply_prefix = apply_error.split(":")[0]
+
+    # Be sure to update the overall dropdown cache of qc errors
+    global _QC_ERROR_LIST_CACHE
+    if apply_prefix not in _QC_ERROR_LIST_CACHE:
+        _QC_ERROR_LIST_CACHE.append(apply_prefix)
+
+    if apply_prefix in current_prefix:
+        if not increment:
+            return False
+
+        # Find the number to increment if any
+        index = current_prefix.index(apply_prefix)
+        match = current_source[index]
+        if ":" not in match:
+            match += ":1"  # Implied occurred once.
+
+        # Extract the last number to take as the # times occurred.
+        init_number = match.split(":")[-1]
+        try:
+            num = int(init_number)
+        except ValueError:
+            print("Error count after : is not an int, cannot increment.")
+            return
+        current_source[index] = f"{apply_prefix}:{num+1}"
+    else:
+        if increment:
+            current_source.append(f"{apply_prefix}:1")
+        else:
+            current_source.append(apply_error)
+    this_row.qc_error = ";".join(current_source)
+    return True
 
 
-def save_qc_error(self, context) -> None:
-    """Save out error as txt, not overwriting if one exists already."""
-    path = qc_error_path(context, self.src_blend)
-    if self.qc_error and not os.path.isfile(path):
-        print(f"To save QC error: {path}")
-        with open(path, 'w') as fd:
-            fd.write(self.qc_error)
+def qc_error_count(qc_error: str, name: str) -> int:
+    """Extracts the number of times this specific qc error has occurred."""
+    if name not in qc_error:
+        return 0
+    errors = qc_error.split(";")
+    for err in errors:
+        if not err.startswith(name):
+            continue
+        if ":" not in err:
+            err += ":1"
+        count = err.split(":")[-1]
+        try:
+            num = int(count)
+        except ValueError:
+            num = 0
+        return num
+    return 0  # Couldn't find it.
 
 
 def update_source_folder(self, context) -> None:
-    """Handler for when the source folder is changed."""
+    """Handler for when the source folder is changed.
+
+    This function can take a long time to load if there are 10,000's of files,
+    and so timings and printouts are used to show progress is still happening,
+    as well as some basic caching approaches to minimize impact of disk reads.
+    """
+    print("Source folder update, reloading rows.")
+    t0 = time.time()
     props = context.scene.crp_props
     props.file_list.clear()
+    t_clear = time.time()
+    print(f'\tCleared props in {t_clear-t0}s')
     blend_files = get_blend_file_list(context)
-    form_data = load_csv_metadata(context)
-    for blend in blend_files:
+    t_filelist = time.time()
+    print(f'\tListed blend files in {t_filelist-t_clear}s')
+    load_csv_metadata(context)
+    t_form_data = time.time()
+    print(f'\tLoaded form data in {t_form_data-t_filelist}s')
+
+    # Let's now do a one-time filelisting to cache paths, to save time on
+    # each row performing individual OS filesystem calls, which can slow down
+    # fuse / remote disk systems.
+    global _EXISTING_FILE_CACHE
+    _EXISTING_FILE_CACHE = []
+    global _QC_ERROR_LIST_CACHE
+    _QC_ERROR_LIST_CACHE = []
+
+    cache_os_paths(context)
+    t_cache_files = time.time()
+    cachelen = len(_EXISTING_FILE_CACHE)
+    print(f'\tCached files in {t_cache_files-t_form_data}s, total: {cachelen}')
+
+    print("\tLoading property rows:")
+    t_prior_snapshot = t_cache_files
+    update_frequency_s = 5  # Time in seconds between console progress prints.
+
+    ind_name = 0
+    ind_country = 1
+    ind_url = 2
+    ind_latest = 3  # Bool of whether this entry is latest from the email.
+
+    for i, blend in enumerate(blend_files):
+
+        # Pre step to get the google form id
+        this_data = get_data_for_blend(blend)
+        form_id = ''
+        if this_data:
+            # Extract the id from the raw url provided.
+            blend_url = this_data.get(ind_url)
+            if blend_url:
+                spl = blend_url.split('?id=')
+                if len(spl) == 2:
+                    form_id = spl[1]
+        if props.output_by_id and form_id:
+            output_id = form_id
+        else:
+            output_id = blend
+
+        # First determine if this row should be loaded, based on filter options
+        # which are one of: all, missing, any_qc, and qc_{name}.
+
+        if props.blend_filter == "all":
+            qc_err = read_qc_error(blend, context)
+            render_exists = renders_exist_for_row(context, output_id)
+        elif props.blend_filter == "missing":
+            render_exists = renders_exist_for_row(context, output_id)
+            if render_exists:
+                continue
+            qc_err = read_qc_error(blend, context)
+        elif props.blend_filter == "any_qc":
+            qc_err = read_qc_error(blend, context)
+            if not qc_err:
+                continue
+            render_exists = renders_exist_for_row(context, output_id)
+        else:  # qc_name.
+            qc_err = read_qc_error(blend, context)
+            if not qc_err or not props.blend_filter[3:] in qc_err:
+                continue
+            render_exists = renders_exist_for_row(context, output_id)
+
+        # Now add the property.
+
         row = props.file_list.add()
         row.label = blend.replace(".blend", "")
         row.name = row.label
         row.src_blend = blend
-        row.qc_error = read_qc_error(row, context)
-        this_data = form_data.get(blend)
+        row.src_file_id = form_id
+        row.qc_error = qc_err
+
+        if not form_id:  # and props.output_by_id:
+            extend_qc_error(row, ERR_NO_FORM_ID)
+        elif ERR_NO_FORM_ID in row.qc_error:
+            # Clear the error out.
+            row.qc_error = row.qc_error.replace(ERR_NO_FORM_ID, "")
+
         if this_data:
-            row.user_name = this_data.get(0) or ""
-            row.country = this_data.get(1) or ""
+            row.user_name = this_data.get(ind_name) or ""
+            row.country = this_data.get(ind_country) or ""
+
+            if this_data.get(ind_latest) is False:
+                extend_qc_error(row, ERR_NOT_LATEST_ENTRY)
 
         row.has_form_match = this_data is not None
-        row.render_exists = renders_exist_for_row(context, row)
+        row.render_exists = render_exists
 
+        t_snapshot = time.time()
+        if t_snapshot - t_prior_snapshot > update_frequency_s:
+            t_prior_snapshot = t_snapshot
+            print(f"\t\t{i/len(blend_files)*100:.0f}%")
+
+    # Now clear the file path cache so it's not used further.
+    _EXISTING_FILE_CACHE = []
+
+    t_rows_loaded = time.time()
+    print(f"\tLoaded rows in {t_rows_loaded-t_form_data}s")
+
+    # Force load the scene by changing the file list index.
     if not props.file_list:
         print("Error - no files loaded")
         return
     elif props.file_list_index >= len(props.file_list):
         props.file_list_index = len(props.file_list) - 1
+    else:
+        props.file_list_index = props.file_list_index
 
-    # Finally, load the new view.
-    load_active_row(context)
+    t_loaded_scene = time.time()
+    print(f"\tLoaded this row in {t_loaded_scene - t_rows_loaded}s")
+    print(f"Overall load time: {t_loaded_scene - t0}s")
+
+
+def get_data_for_blend(blend: str) -> Optional[Dict]:
+    """Return the best matching data row for the blend file."""
+    this_data = _FORM_DATA.get(blend)
+    if this_data:
+        return this_data
+
+    prefix, ext = os.path.splitext(blend)
+    this_data = _FORM_DATA.get(prefix[:-4] + ext)  # Drop off ' (1)'
+    if this_data:
+        return this_data
+
+    # Without an exact match, fall back to fuzzy matching.
+    # Sadly, we have to run this iteration over the entire tsv, which will be
+    # quite slow. But the number that need this by this point should be small.
+    for key in _FORM_DATA:
+        if SM(None, blend, key).ratio() > 0.95:
+            # At least a 90% match, which actually may still be overly broad.
+            return _FORM_DATA.get(key)
+
+    # Still failed to get a match
+    return None
 
 
 def update_folderset_list_index(self, context) -> None:
     """Handler for when new row is selected, load the given blend."""
+    save_blend_to_crash_cache(context)
     load_active_row(context)
+    clear_blend_crash_cach(context)
 
 
 def update_scene_stats(context) -> None:
@@ -1276,6 +1712,19 @@ def update_use_text(self, context) -> None:
             txt_country.data.body = ""
 
 
+def get_filter_enum(self, context):
+    """Return the filter dropdown."""
+    qc_errs = get_all_qc_errors(context)
+    res = [
+        ("all", "Show all", "Show all blend files"),
+        ("missing", "Show un-rendered", "Show blend missing renders"),
+        ("any_qc", "Any QC error(s)", "Show any blend file with QC errors")
+    ]
+    qcs = [(f"qc_{name}", f"Error: {name}", f"Show blends with the {name} qc error")
+           for name in qc_errs]
+    return tuple(res + qcs)
+
+
 def update_demo_mode(self, context) -> None:
     """Update the timer used for demo mode."""
     props = context.scene.crp_props
@@ -1306,16 +1755,17 @@ def demo_timer_callback() -> float:
 
 class FileListProps(bpy.types.PropertyGroup):
     """List and data structure to check stats of loaded blend submissions."""
-    label = bpy.props.StringProperty(default="")
-    render_exists = bpy.props.BoolProperty(default=False)
-    has_form_match = bpy.props.BoolProperty(default=False)
-    qc_error = bpy.props.StringProperty(
-        default="", update=save_qc_error)  # Will skip its render.
-    qc_warn = bpy.props.StringProperty(default="")  # Will render.
-    user_name = bpy.props.StringProperty(default="")
-    country = bpy.props.StringProperty(default="")
-    src_blend = bpy.props.StringProperty(default="")
-    queue_status = bpy.props.EnumProperty(
+    label: bpy.props.StringProperty(default="")
+    render_exists: bpy.props.BoolProperty(default=False)
+    has_form_match: bpy.props.BoolProperty(default=False)
+    qc_error: bpy.props.StringProperty(
+        default="", update=update_qc_error)
+    # qc_warn: bpy.props.StringProperty(default="")  # Will render.
+    user_name: bpy.props.StringProperty(default="")
+    country: bpy.props.StringProperty(default="")
+    src_blend: bpy.props.StringProperty(default="")
+    src_file_id: bpy.props.StringProperty(default="")
+    queue_status: bpy.props.EnumProperty(
         name="Queue status",
         items=(
             (NOT_QUEUED, "Not queued", "Not currently queued"),
@@ -1334,63 +1784,67 @@ class CRP_UL_source_files(bpy.types.UIList):
         row.label(text=item.label)
         if item.qc_error:
             row.label(text="", icon="ERROR")
-        elif item.queue_status == READY:
-            row.label(text="", icon="CHECKBOX_DEHLT")
-        elif item.queue_status == DONE:
-            row.label(text="", icon="CHECKBOX_HLT")
+        # elif item.queue_status == READY:
+        #     row.label(text="", icon="CHECKBOX_DEHLT")
+        # elif item.queue_status == DONE:
+        #     row.label(text="", icon="CHECKBOX_HLT")
         icon = "RESTRICT_RENDER_OFF" if item.render_exists else "RESTRICT_RENDER_ON"
         row.label(text="", icon=icon)
 
 
 class SceneProps(bpy.types.PropertyGroup):
     """All properties used by this addon, saved with blend file to scene."""
-    config_folder = bpy.props.StringProperty(
+    config_folder: bpy.props.StringProperty(
         name="TSV/Renders",
         description="Folder for render outputs and form_responses.tsv file",
         subtype='DIR_PATH')
-    source_folder = bpy.props.StringProperty(
+    source_folder: bpy.props.StringProperty(
         name="Blends",
         description="Folder containing all blend files",
         subtype='DIR_PATH',
         update=update_source_folder)
-    file_list = bpy.props.CollectionProperty(type=FileListProps)
-    file_list_index = bpy.props.IntProperty(
+    file_list: bpy.props.CollectionProperty(type=FileListProps)
+    file_list_index: bpy.props.IntProperty(
         default=0,
         update=update_folderset_list_index)
-    render_running = bpy.props.BoolProperty(
+    render_running: bpy.props.BoolProperty(
         name="Render in progress",
         description="Internal bool used to see if mid render queue",
         default=False)
-    load_original = bpy.props.BoolProperty(
+    load_original: bpy.props.BoolProperty(
         name="Load original",
         description="Load the source, unmodified scene (don't use in render!)",
         default=False,
         update=update_folderset_list_index)
-    use_text = bpy.props.BoolProperty(
+    use_text: bpy.props.BoolProperty(
         name="Use text",
         description="Populate the text in the full-sized renders",
         default=False,
         update=update_use_text)
-    demo_mode = bpy.props.BoolProperty(
+    demo_mode: bpy.props.BoolProperty(
         name="Demo mode",
         description="Auto progress to next file after (Demo Interval) seconds",
         default=False,
         update=update_demo_mode)
-    demo_interval = bpy.props.FloatProperty(
+    demo_interval: bpy.props.FloatProperty(
         name="Interval",
         description="Delay between progressing to next blend file",
         default=2.0,
         min=0.5)
-    thumbnail_pixels = bpy.props.IntProperty(
+    thumbnail_pixels: bpy.props.IntProperty(
         name="Thumbnail size",
         description="Pixel height and width of thumbnail render",
         default=100,
         min=10)
-
-    # Filter properties
-
-    # Enum option of which blend files to load? e.g.:
-    # All in folder, all in CSV (grand total), all rendered, all not-rendered
+    blend_filter: bpy.props.EnumProperty(
+        name="Filter",
+        description="Filter for specific blend file rows",
+        items=get_filter_enum,
+        update=update_source_folder)
+    output_by_id: bpy.props.BoolProperty(
+        name="Save id",
+        description="Name output renders by id from Google form, if any",
+        default=True)
 
 
 class CRP_PT_CommunityPanel(bpy.types.Panel):
@@ -1442,11 +1896,15 @@ class CRP_PT_CommunityPanel(bpy.types.Panel):
             return
 
         row = layout.row(align=True)
+        row.prop(props, "blend_filter")
+        row = layout.row(align=True)
         row.label(text="Click row to load")
         row.operator(
             SCENE_OT_open_previous_file.bl_idname, text="", icon="TRIA_UP")
         row.operator(
             SCENE_OT_open_next_file.bl_idname, text="", icon="TRIA_DOWN")
+        row.operator(
+            SCENE_OT_load_from_id.bl_idname, text="", icon="VIEWZOOM")
         row.operator(SCENE_OT_reload.bl_idname, text="", icon="FILE_REFRESH")
 
         row = layout.row()
@@ -1465,6 +1923,7 @@ class CRP_PT_CommunityPanel(bpy.types.Panel):
         subrow = main_col.row(align=True)
         subrow.prop(props, "load_original")
         subrow.prop(props, "use_text")
+        subrow.prop(props, "output_by_id")
 
         subrow = main_col.row(align=True)
         cubrowcol = subrow.column()
@@ -1496,6 +1955,7 @@ class CRP_PT_RowInfoStats(bpy.types.Panel):
         col.label(text="ACTIVE ROW STATS", icon="ONIONSKIN_OFF")
         col.label(text=f"Current row: {props.file_list_index+1}")
         col.label(text=f"Blend file: {this_row.src_blend}")
+        col.label(text=f"Form id: {this_row.src_file_id}")
         col.label(text=f"Author: {this_row.user_name} ({this_row.country})")
         col.label(text=f"Found in form: {this_row.has_form_match}")
         col.label(text=f"Rendered: {this_row.render_exists}")
@@ -1596,13 +2056,13 @@ classes = (
     SCENE_OT_render_all_interactive,
     SCENE_OT_mark_qc_error,
     SCENE_OT_delete_render,
+    SCENE_OT_load_from_id
 )
 
 
 def register():
     """Register operator functions and properties."""
     for cls in classes:
-        make_annotations(cls)
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.crp_props = bpy.props.PointerProperty(type=SceneProps)
