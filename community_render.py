@@ -39,6 +39,7 @@ Some key factors for how this addon works:
 """
 
 import csv
+from difflib import SequenceMatcher as SM
 import os
 import random
 import time
