@@ -485,7 +485,6 @@ def replace_view_layer(context, scene: bpy.types.Scene) -> bpy.types.Object:
         obj.empty_display_type = 'CUBE'
         obj.empty_display_size = 0.1
 
-    obj.location = (0, 0, 0)
     return obj
 
 
@@ -582,6 +581,10 @@ def process_generic_scene(context) -> None:
         print(f"{len(coll.all_objects)} in {coll.name}")
         raise Exception("Issue - more than one object in collection!")
 
+    # Center the actual source scene itself back to the origin.
+    scene_obj = coll.all_objects[0]
+    scene_obj.location = (0, 0, 0)
+
     scene = get_loaded_scene(context)
 
     # Now run any of the transformation steps. This are directly modifying the
@@ -670,6 +673,10 @@ def process_as_donut(context):
         print("Expected only a single object in collection, found:")
         print(f"{len(coll.all_objects)} in {coll.name}")
         raise Exception("Issue - more than one object in collection!")
+
+    # Center the actual source scene itself back to the origin.
+    scene_obj = coll.all_objects[0]
+    scene_obj.location = (0, 0, 0)
 
     scn = get_loaded_scene(context)
     clear_all_animation(scn)
